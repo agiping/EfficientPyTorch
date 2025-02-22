@@ -39,7 +39,7 @@ run(data, model)
 
 ```
 
-**关于PyTorch中nonzero操作的性能分析**
+**原书关于nonzero操作导致隐式同步的分析**
 
 1. **现象解释**：
 - `torch.nonzero()`触发GPU到CPU的数据拷贝（cudaMemcpyAsync）
