@@ -63,3 +63,38 @@ run(data, model)
 - 优化应该着眼于整体架构设计，而不是纠结于同步时机的调整
 - 真正的优化空间在于如何更好地利用GPU-CPU并行计算的特性
 
+
+# 6.4 降低程序中的额外开销
+
+1. PyTorch 通过Python提供接口易用性，通过C++实现高性能，两层逻辑，两层开销；Python层的开销属于 “易用税”
+
+2. 直接在GPU上创建张量，避免在CPU创建/初始化后在拷贝到GPU 
+
+3. 大部分 PyTorch 操作默认会为返回变量创建新内存
+
+4. 尽量使用张量的原位操作，避免显式/隐式创建新张量：
+
+```python
+# inplace
+# 进程无须申请显存，直接向gpu提交任务：cudaLaunchKernel
+data.mul_(2)
+
+# non-inplace
+data = data.mul(2)
+```
+
+5. 尽量使用 inplace 操作，避免显式/隐式创建新张量：
+
+```python
+data.mul_(2)
+```
+
+6. 关闭不必要的梯度计算，如模型微调场景下，预训练模型的前向；如推理场景：
+
+```python
+torch.no_grad()
+model.eval()
+torch.inference_mode()
+with torch.inference_mode(mode=True/False):
+    # 上下文管理，灵活开/关
+```
