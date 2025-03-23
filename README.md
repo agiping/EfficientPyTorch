@@ -2,6 +2,18 @@
 在学习张爱玲和杨占略合著的 《PyTorch性能与显存优化手册》时，记录的一些疑问。其中大部分疑问和 Claude 3.5 Sonnet、DeepSeek-R1 等讨论过。
 原书代码地址参见：https://github.com/ailzhang/EfficientPyTorch
 
+# 3.1 PyTorch 的张量数据结构
+1. 张量是数据容器，提供了统一的方式来处理不同维度和形状的数据；
+2. 插入一个新的维度：
+```python
+# x is a tensor with shape of [10, 20]
+x = x[:, None, :]
+# 返回张量的形状为 [10, 1, 20]
+```
+3. 张量的本质：对其底层数据存储的一种特定的访问和解释方式。每个张量底层都有一个 `torch.Storage` 来存储数据，多个张量可以共享同一个 `torch.Storage`.
+4.  
+
+
 # 3.2 PyTorch 中的算子
 1. Pytorch 算子库包括基础数学运算、线性代数运算、逻辑和比较运算、张量操作、AI模型层与损失函数等特殊运算。
 2. 逻辑和比较运算示例：
