@@ -213,3 +213,277 @@ with torch.inference_mode(mode=True/False):
 2. 明确数据的值域很重要，方便判断低精度压缩的程度，该用多大的压缩率，损失多大；
 3. 尽量使用性能特化过的优化器，如算子融合后的 fused, for-each 等，而不是原生的 for-loop; 减少算子的调用、调度开销，提高性能。
 
+
+# A1. CUDA Graph 与 torch.compile
+
+## 1. CUDA Graph
+
+### 1.1 基本概念
+CUDA Graph 是 NVIDIA 在 CUDA 10.0 引入的特性，允许将一系列 GPU 操作（kernel 启动、内存拷贝等）预定义为图结构，一次性执行整个计算图。本质上是执行过程的优化，而非计算本身的优化。
+
+### 1.2 工作原理
+**两阶段执行模式**：
+- **捕获阶段**：记录完整的 GPU 操作序列
+- **重放阶段**：一次性提交整个操作序列给 GPU 执行
+
+**具体实现流程**：
+```python
+# 捕获阶段
+graph = torch.cuda.CUDAGraph()
+with torch.cuda.graph(graph):
+    output = model(input_tensor)
+
+# 重放阶段
+graph.replay()
+```
+
+### 1.3 性能提升机制
+1. **减少 CPU-GPU 通信开销**：传统执行每个操作都需要 CPU 参与，CUDA Graph 只需一次 CPU 调用
+2. **优化调度**：GPU 可以全局规划资源分配
+3. **减少 kernel 启动延迟**：消除 CPU 指令分发和驱动层处理的延迟
+4. **提高 GPU 利用率**：减少 GPU 空闲等待时间
+
+### 1.4 使用限制
+1. **输入固定**：图捕获后，输入形状必须保持一致
+2. **静态执行图**：不能包含动态控制流
+3. **固定内存分配**：不支持动态内存分配/释放
+
+## 2. torch.compile 
+
+### 2.1 基本概念
+torch.compile 是 PyTorch 2.0 引入的即时编译（JIT）技术，通过编译优化将 PyTorch 模型转换为更高效的计算代码。本质上是计算内容的优化。
+
+### 2.2 工作原理
+**多阶段编译优化流程**：
+1. **计算图捕获**：通过 FX 图捕获框架获取模型计算图
+2. **图优化**：进行算子融合、死代码消除等优化
+3. **代码生成**：生成针对特定硬件的优化代码（如 Triton kernel）
+4. **编译执行**：编译生成的代码并缓存供后续使用
+
+**核心实现示例**：
+```python
+# 基本使用方式
+optimized_model = torch.compile(
+    model,
+    mode="max-autotune",
+    dynamic=False
+)
+output = optimized_model(input_tensor)
+```
+
+### 2.3 性能提升机制
+1. **操作融合**：将多个小操作合并为一个大操作，减少内存访问
+2. **内存优化**：减少中间结果，优化内存布局
+3. **自动调优**：为特定 GPU 架构生成优化的 kernel 参数
+4. **Triton kernel 生成**：使用 Triton 编程模型生成高效 CUDA kernel
+
+### 2.4 使用限制
+1. **首次编译开销**：初次编译时间可能很长（数十秒至数分钟）
+2. **内存消耗**：编译过程需要较大内存
+3. **兼容性**：某些自定义操作可能不兼容
+4. **调试难度**：生成代码难以直接调试
+
+## 3. SGLang 中的实现与优化策略
+
+### 3.1 CUDA Graph 实现策略
+
+**多 batch size 预捕获**：
+```python
+def get_batch_sizes_to_capture(model_runner: ModelRunner):
+    # 如果未指定，使用预定义的 batch size 列表
+    if capture_bs is None:
+        if server_args.disable_cuda_graph_padding:
+            capture_bs = list(range(1, 33)) + [64, 96, 128, 160]
+        else:
+            capture_bs = [1, 2, 4] + [i * 8 for i in range(1, 21)]
+```
+
+**处理可变 batch size**：
+```python
+def replay_prepare(self, forward_batch: ForwardBatch):
+    # 向上匹配最接近的 batch size
+    index = bisect.bisect_left(self.capture_bs, raw_bs)
+    bs = self.capture_bs[index]
+    # 当需要填充时，进行特殊处理
+    if bs != raw_bs:
+        self.seq_lens.fill_(1)
+        self.out_cache_loc.zero_()
+```
+
+**内存管理优化**：
+```python
+# 重用内存池减少碎片
+with torch.cuda.graph(graph, pool=global_graph_memory_pool, stream=stream):
+    out = run_once()
+global_graph_memory_pool = graph.pool()
+```
+
+### 3.2 torch.compile 实现策略
+
+**选择性编译**：
+```python
+# 只对较小的 batch size 应用 torch.compile
+compile_bs = [bs for bs in capture_bs if bs <= server_args.torch_compile_max_bs] 
+    if server_args.enable_torch_compile else []
+```
+
+**模型自适应**：
+```python
+def _to_torch(model: torch.nn.Module, reverse: bool, num_tokens: int):
+    for sub in model._modules.values():
+        if isinstance(sub, CustomOp):
+            if reverse:
+                sub._forward_method = sub.forward_cuda
+            else:
+                # 特殊处理某些层
+                if "FusedMoE" in sub.__class__.__name__:
+                    if num_tokens == 1:
+                        sub._forward_method = fused_moe_forward_native
+                else:
+                    sub._forward_method = sub.forward_native
+```
+
+### 3.3 两者结合策略
+
+**分层优化应用**：
+```python
+with patch_model(
+    self.model_runner.model,
+    bs in self.compile_bs,  # 条件性使用 torch.compile
+    num_tokens=bs * self.num_tokens_per_bs,
+    tp_group=self.model_runner.tp_group,
+) as forward:
+    # 再通过 CUDA Graph 捕获优化后的执行
+    graph, output_buffers = self.capture_one_batch_size(bs, forward)
+```
+
+## 4. 关键技术细节与最佳实践
+
+### 4.1 CUDA Graph 关键技术细节
+
+**预分配内存与输入更新**：
+```python
+# 预分配足够大的缓冲区
+self.input_ids = torch.zeros((self.max_num_token,), dtype=torch.int64)
+
+# 重放前更新输入
+self.input_ids[:raw_num_token].copy_(forward_batch.input_ids)
+```
+
+**静态填充值处理**：
+```python
+# 使用特定值填充序列长度
+self.seq_len_fill_value = self.model_runner.attn_backend.get_cuda_graph_seq_len_fill_value()
+self.seq_lens = torch.full((self.max_bs,), self.seq_len_fill_value, dtype=torch.int32)
+```
+
+**Graph 捕获预热**：
+```python
+# 捕获前预热执行两次，确保稳定
+for _ in range(2):
+    torch.cuda.synchronize()
+    self.model_runner.tp_group.barrier()
+    run_once()
+```
+
+### 4.2 torch.compile 关键技术细节
+
+**动态性控制**：
+```python
+yield torch.compile(
+    torch.no_grad()(model.forward),  # 固定为推理模式
+    mode="max-autotune-no-cudagraphs",  # 使用最大自动调优
+    dynamic=False,  # 关闭动态形状支持
+)
+```
+
+**自定义操作处理**：
+```python
+# 为自定义操作设置特定标记和实现方法
+if isinstance(sub, CustomOp):
+    sub._forward_method = sub.forward_native
+    setattr(sub, "is_torch_compile", True)
+```
+
+**缓存管理**：
+```python
+# 调整缓存大小限制
+torch._dynamo.config.accumulated_cache_size_limit = 1024
+if hasattr(torch._dynamo.config, "cache_size_limit"):
+    torch._dynamo.config.cache_size_limit = 1024
+```
+
+### 4.3 内存管理策略
+
+**显存占用控制**：
+- CUDA Graph 通常增加 10-30% 的基本模型内存占用
+- 预捕获的 batch size 范围直接影响显存占用
+- 使用共享内存池减少碎片
+
+**权衡与调优参数**：
+```python
+# 用户可配置参数
+parser.add_argument("--cuda-graph-max-bs", type=int, default=160)
+parser.add_argument("--torch-compile-max-bs", type=int, default=32)
+parser.add_argument("--disable-cuda-graph-padding", action="store_true")
+```
+
+## 5. 性能对比与实际应用
+
+### 5.1 性能提升分析
+
+**典型性能提升**：
+- CUDA Graph：小 batch 场景下减少 30%-70% 推理延迟
+- torch.compile：视模型结构提升 10%-30% 计算效率
+- 结合使用：可达到 30%-60% 的综合性能提升
+
+**批量大小影响**：
+- 小批量（1-8）：CUDA Graph 提升最显著
+- 中等批量（8-64）：两者结合效果最佳
+- 大批量（>64）：torch.compile 相对贡献更大
+
+### 5.2 应用场景适配
+
+**适用场景**：
+- 在线推理服务：低延迟、小批量
+- 批处理任务：固定输入大小，重复执行
+- 多模态模型：涉及多个执行步骤
+
+**不适用场景**：
+- 高度动态的批量大小和输入形状
+- 需频繁修改模型参数的场景（如强化？）
+- 内存极度受限的环境
+
+### 5.3 部署建议
+
+**关键部署参数**：
+- 合理设置 `cuda-graph-max-bs` 和 `torch-compile-max-bs`
+- 预热阶段分配足够时间完成编译
+- 监控内存使用情况
+
+**框架选择**：
+- 延迟敏感型：优先 CUDA Graph
+- 吞吐量敏感型：优先 torch.compile
+- 生产环境：两者结合，依据硬件资源调整配置
+
+## 6. 总结与展望
+
+### 6.1 关键结论
+
+1. **互补优势**：CUDA Graph 优化执行调度，torch.compile 优化计算内容
+2. **实现策略**：预捕获多种 batch size + 向上匹配填充是处理动态批量的有效方法
+3. **内存权衡**：需在性能提升和额外内存消耗间取得平衡
+4. **框架集成**：SGLang 展示了两种技术如何有效结合，实现最佳性能
+
+### 6.2 未来趋势
+
+1. **编译优化进展**：更智能的自动调优和操作融合
+2. **内存效率**：更高效的内存管理策略减少冗余
+3. **动态支持**：改进对动态形状的处理能力
+4. **硬件协同**：更深度结合特定硬件架构特性
+
+## 7. RL 训练中的使用
+
+1. 对于 CUDA Graph, 如果仅仅是模型的参数值发生了变化（如一轮训练后被更新），则通常不需要重新进行捕获；
+2. 但如果参数更新的过程中，参数张量的内存地址，即地址指针发生了变化，则 cuda graph 需要重新捕获，这种情况下，使用 cuda graph 的效率就比价低；
+3. 参数精度变化：如从 FP32 切换到 FP16 或 INT8，也会触发重捕获；
